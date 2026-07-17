@@ -1,0 +1,340 @@
+(ns facilityops.governor-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [facilityops.store :as store]
+            [facilityops.advisor :as advisor]
+            [facilityops.governor :as governor]))
+
+(defn- fresh-store []
+  (let [st (store/mem-store)]
+    (store/register-officer! st {:officer-id "O-1" :name "Officer Tanaka"
+                                 :facility-id "facility-9" :verified? true})
+    (store/register-facility! st {:facility-id "facility-9"
+                                  :max-supply-cost 500 :verified? true})
+    st))
+
+(defn- log-op []
+  {:op :log-facility-record :effect :propose :officer-id "O-1" :facility-id "facility-9"
+   :equipment-id "CAM-14" :system :perimeter-camera :condition :operational
+   :timestamp "2026-07-14T10:00:00Z" :stake :low :confidence 0.9
+   :rationale "documented log-facility-record for facility facility-9"})
+
+(defn- staff-op-op []
+  {:op :schedule-staff-operation :effect :propose :officer-id "O-1" :facility-id "facility-9"
+   :operation-type :shift :proposed-time "2026-07-20T06:00:00Z"
+   :location "unit B roster" :stake :low :confidence 0.9
+   :rationale "documented schedule-staff-operation for facility facility-9"})
+
+(defn- flag-op
+  ([] (flag-op nil))
+  ([facility-id]
+   {:op :flag-facility-concern :effect :propose :officer-id "O-1" :facility-id facility-id
+    :concern-type :equipment :note "perimeter camera intermittently offline" :stake :low :confidence 0.9
+    :rationale "documented flag-facility-concern for facility (no facility yet — concern intake)"}))
+
+(defn- supply-op
+  ([cost] (supply-op cost "first-aid kit"))
+  ([cost item]
+   {:op :coordinate-supply-order :effect :propose :officer-id "O-1" :facility-id "facility-9"
+    :item item :item-category :medical-supply :cost cost :vendor "FacilitySupplyCo"
+    :stake :low :confidence 0.9
+    :rationale "documented coordinate-supply-order for facility facility-9"}))
+
+(def ^:private req {})
+
+;; --- happy path -----------------------------------------------------
+
+(deftest ok-well-formed-log-entry
+  (let [st (fresh-store)
+        v (governor/check req {} (log-op) st)]
+    (is (:ok? v))
+    (is (not (:hard? v)))
+    (is (not (:escalate? v)))))
+
+(deftest ok-well-formed-staff-operation-scheduling
+  (let [st (fresh-store)
+        v (governor/check req {} (staff-op-op) st)]
+    (is (:ok? v))))
+
+(deftest ok-at-or-below-threshold-supply-order
+  (let [st (fresh-store)
+        v (governor/check req {} (supply-op 250) st)]
+    (is (:ok? v))))
+
+(deftest ok-at-exact-supply-cost-threshold-boundary
+  (testing "the supply-cost escalation threshold is inclusive (exactly-at-threshold does not escalate)"
+    (let [st (fresh-store)
+          v (governor/check req {} (supply-op governor/supply-cost-escalation-threshold) st)]
+      (is (:ok? v))
+      (is (not (:escalate? v))))))
+
+;; --- officer provenance ----------------------------------------------
+
+(deftest hard-on-unregistered-officer
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :officer-id "ghost") st)]
+    (is (:hard? v))
+    (is (some #(= :unknown-officer (:rule %)) (:violations v)))))
+
+(deftest hard-on-unverified-officer
+  (let [st (fresh-store)]
+    (store/register-officer! st {:officer-id "O-2" :name "Unverified"
+                                 :facility-id "facility-9" :verified? false})
+    (let [v (governor/check req {} (assoc (log-op) :officer-id "O-2") st)]
+      (is (:hard? v))
+      (is (some #(= :officer-unverified (:rule %)) (:violations v))))))
+
+;; --- facility provenance ---------------------------------------------
+
+(deftest hard-on-missing-facility-id
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :facility-id nil) st)]
+    (is (:hard? v))
+    (is (some #(= :missing-facility-id (:rule %)) (:violations v)))))
+
+(deftest hard-on-unknown-facility
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :facility-id "facility-ghost") st)]
+    (is (:hard? v))
+    (is (some #(= :unknown-facility (:rule %)) (:violations v)))))
+
+(deftest hard-on-unverified-facility
+  (let [st (fresh-store)]
+    (store/register-facility! st {:facility-id "facility-2"
+                                  :max-supply-cost 500 :verified? false})
+    (store/register-officer! st {:officer-id "O-3" :name "Officer Diallo"
+                                 :facility-id "facility-2" :verified? true})
+    (let [v (governor/check req {} (assoc (log-op) :officer-id "O-3" :facility-id "facility-2") st)]
+      (is (:hard? v))
+      (is (some #(= :facility-unverified (:rule %)) (:violations v))))))
+
+(deftest hard-on-facility-mismatch
+  (let [st (fresh-store)]
+    (store/register-facility! st {:facility-id "facility-1"
+                                  :max-supply-cost 500 :verified? true})
+    (let [v (governor/check req {} (assoc (log-op) :facility-id "facility-1") st)]
+      (is (:hard? v))
+      (is (some #(= :facility-mismatch (:rule %)) (:violations v))))))
+
+(deftest flag-facility-concern-does-not-require-existing-facility
+  (testing "flag-facility-concern is the channel by which a concern is surfaced before facility paperwork is complete"
+    (let [st (fresh-store)
+          v (governor/check req {} (flag-op nil) st)]
+      (is (not (:hard? v)))
+      (is (:escalate? v)))))
+
+;; --- no-actuation / closed allowlist ----------------------------------
+
+(deftest hard-on-no-actuation-violation
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :effect :direct-write) st)]
+    (is (:hard? v))
+    (is (some #(= :no-actuation (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-apply-physical-restraint
+  (testing "no path through this actor can apply a physical restraint — no such op exists in the allowlist to
+            begin with; this asserts the governor also rejects one forged onto a proposal"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (log-op) :op :apply-physical-restraint) st)]
+      (is (:hard? v))
+      (is (some #(= :op-not-allowed (:rule %)) (:violations v))))))
+
+(deftest hard-on-op-not-allowed-use-force
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :use-force) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-impose-disciplinary-sanction
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :impose-disciplinary-sanction) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-impose-solitary-confinement
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :impose-solitary-confinement) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-restrict-inmate-movement
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :restrict-inmate-movement) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest hard-on-op-not-allowed-determine-confinement-conditions
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :op :determine-confinement-conditions) st)]
+    (is (:hard? v))
+    (is (some #(= :op-not-allowed (:rule %)) (:violations v)))))
+
+(deftest every-scope-excluded-op-name-is-rejected
+  (testing "every explicitly named scope-excluded op fixture is a hard, permanent block"
+    (let [st (fresh-store)]
+      (doseq [op governor/scope-excluded-ops]
+        (let [v (governor/check req {} (assoc (log-op) :op op) st)]
+          (is (:hard? v) (str "op " op " was not hard-blocked"))
+          (is (some #(= :op-not-allowed (:rule %)) (:violations v))
+              (str "op " op " did not trip :op-not-allowed")))))))
+
+;; --- incarcerated-person-conclusion / staff-operation-content forbidden ---
+
+(deftest hard-on-incarcerated-person-conclusion-forbidden
+  (testing "log-facility-record is an equipment/security-system condition record only — identifying or drawing
+            a conclusion about a specific incarcerated person is forbidden"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (log-op) :incarcerated-person-id "IP-42") st)]
+      (is (:hard? v))
+      (is (some #(= :incarcerated-person-conclusion-forbidden (:rule %)) (:violations v))))))
+
+(deftest hard-on-incarcerated-person-conclusion-forbidden-disciplinary-key
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :disciplinary-conclusion :sanctioned) st)]
+    (is (:hard? v))
+    (is (some #(= :incarcerated-person-conclusion-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-staff-operation-content-forbidden
+  (testing "schedule-staff-operation never carries a use-of-force/restraint/extraction operational plan"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (staff-op-op) :force-plan "coordinated cell entry at 0600") st)]
+      (is (:hard? v))
+      (is (some #(= :staff-operation-content-forbidden (:rule %)) (:violations v))))))
+
+(deftest hard-on-staff-operation-content-forbidden-restraint-plan-key
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (staff-op-op) :restraint-plan "two-officer restraint hold") st)]
+    (is (:hard? v))
+    (is (some #(= :staff-operation-content-forbidden (:rule %)) (:violations v)))))
+
+;; --- weapon/restraint-device supply forbidden (hard, cost-independent) ----
+
+(deftest hard-on-weapon-restraint-supply-item-firearm
+  (testing "a weapon item is hard-blocked regardless of cost"
+    (let [st (fresh-store)
+          v (governor/check req {} (supply-op 10 "sidearm firearm") st)]
+      (is (:hard? v))
+      (is (some #(= :weapon-restraint-item-forbidden (:rule %)) (:violations v))))))
+
+(deftest hard-on-weapon-restraint-supply-item-handcuffs
+  (let [st (fresh-store)
+        v (governor/check req {} (supply-op 10 "handcuffs, standard issue") st)]
+    (is (:hard? v))
+    (is (some #(= :weapon-restraint-item-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-weapon-restraint-supply-item-restraint-chair
+  (let [st (fresh-store)
+        v (governor/check req {} (supply-op 10 "restraint chair") st)]
+    (is (:hard? v))
+    (is (some #(= :weapon-restraint-item-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-weapon-restraint-supply-item-pepper-spray
+  (let [st (fresh-store)
+        v (governor/check req {} (supply-op 10 "OC pepper spray canister") st)]
+    (is (:hard? v))
+    (is (some #(= :weapon-restraint-item-forbidden (:rule %)) (:violations v)))))
+
+(deftest hard-on-weapon-restraint-supply-item-via-category
+  (testing "the weapon/restraint check also inspects :item-category, not just :item"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (supply-op 10 "unit 4 gear") :item-category "restraint-device") st)]
+      (is (:hard? v))
+      (is (some #(= :weapon-restraint-item-forbidden (:rule %)) (:violations v))))))
+
+(deftest ok-non-weapon-supply-item-not-blocked
+  (let [st (fresh-store)
+        v (governor/check req {} (supply-op 10 "first-aid kit") st)]
+    (is (:ok? v))
+    (is (not (:hard? v)))))
+
+;; --- scope-excluded rationale (defense-in-depth) -----------------------
+
+(deftest hard-on-scope-excluded-restraint-rationale
+  (testing "a proposal on an otherwise-allowed op whose rationale names a finalization action for applying
+            physical restraint is a permanent HARD block, independent of the op-allowlist check"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (log-op) :rationale "logged the equipment in order to apply the physical restraint") st)]
+      (is (:hard? v))
+      (is (some #(= :scope-excluded (:rule %)) (:violations v))))))
+
+(deftest hard-on-scope-excluded-use-of-force-rationale
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :rationale "logged the record to authorize the use of force") st)]
+    (is (:hard? v))
+    (is (some #(= :scope-excluded (:rule %)) (:violations v)))))
+
+(deftest hard-on-scope-excluded-disciplinary-sanction-rationale
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :rationale "logged the entry to impose the disciplinary sanction") st)]
+    (is (:hard? v))
+    (is (some #(= :scope-excluded (:rule %)) (:violations v)))))
+
+(deftest hard-on-scope-excluded-movement-restriction-rationale
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :rationale "logged the note to restrict movement privileges") st)]
+    (is (:hard? v))
+    (is (some #(= :scope-excluded (:rule %)) (:violations v)))))
+
+(deftest hard-on-scope-excluded-note-field
+  (testing "the scope-exclusion check also inspects :note (used by flag-facility-concern)"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (flag-op "facility-9") :note "recommend we apply the physical restraint today") st)]
+      (is (:hard? v))
+      (is (some #(= :scope-excluded (:rule %)) (:violations v))))))
+
+;; --- escalation ---------------------------------------------------------
+
+(deftest always-escalates-flag-facility-concern-even-at-high-confidence
+  (testing "surfacing a facility concern always requires human corrections officer/supervisor review"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (flag-op "facility-9") :confidence 0.99) st)]
+      (is (not (:hard? v)))
+      (is (:escalate? v)))))
+
+(deftest always-escalates-above-threshold-supply-order
+  (testing "a non-weapon facility-equipment supply order above the cost threshold always needs human sign-off"
+    (let [st (fresh-store)
+          v (governor/check req {} (assoc (supply-op (+ governor/supply-cost-escalation-threshold 1))
+                                          :confidence 0.99)
+                            st)]
+      (is (not (:hard? v)))
+      (is (:escalate? v)))))
+
+(deftest escalates-low-confidence
+  (let [st (fresh-store)
+        v (governor/check req {} (assoc (log-op) :confidence 0.3) st)]
+    (is (not (:hard? v)))
+    (is (:escalate? v))))
+
+;; --- fleet-known self-trip regression -----------------------------------
+
+(deftest default-mock-advisor-proposals-never-self-trip-scope-exclusion
+  (testing "the default mock advisor's own rationale text for every op in the closed allowlist never contains
+            a scope-excluded finalization/execution phrase for applying physical restraint, using force,
+            imposing a disciplinary sanction, or restricting an incarcerated person's movement/confinement
+            conditions (fleet-known self-trip bug class regression)"
+    (let [st (fresh-store)
+          adv (advisor/mock-advisor)
+          requests [{:op :log-facility-record :officer-id "O-1" :facility-id "facility-9" :stake :low
+                     :equipment-id "CAM-14" :system :perimeter-camera :condition :operational
+                     :timestamp "2026-07-14T10:00:00Z"}
+                    {:op :schedule-staff-operation :officer-id "O-1" :facility-id "facility-9" :stake :low
+                     :operation-type :training :proposed-time "2026-07-20T09:00:00Z" :location "training room 2"}
+                    {:op :flag-facility-concern :officer-id "O-1" :facility-id "facility-9" :stake :low
+                     :concern-type :security-system :note "door sensor deadline for recertification in 30 days"}
+                    {:op :flag-facility-concern :officer-id "O-1" :facility-id nil :stake :low
+                     :concern-type :staffing :note "night shift understaffed, needs supervisor review"}
+                    {:op :coordinate-supply-order :officer-id "O-1" :facility-id "facility-9" :stake :low
+                     :item "first-aid supplies" :item-category :medical-supply :cost 40 :vendor "MedSupplyCo"}]]
+      (doseq [req' requests]
+        (let [proposal (advisor/-advise adv st req')]
+          (is (false? (governor/out-of-scope? proposal))
+              (str "op " (:op req') " self-tripped scope-exclusion: " (:rationale proposal)))
+          (is (false? (governor/weapon-restraint-item? proposal))
+              (str "op " (:op req') " self-tripped weapon-restraint-item check"))
+          (let [v (governor/check {} {} proposal st)]
+            (is (not (contains? (set (map :rule (:violations v))) :scope-excluded))
+                (str "op " (:op req') " tripped :scope-excluded in governor/check"))
+            (is (not (contains? (set (map :rule (:violations v))) :op-not-allowed))
+                (str "op " (:op req') " tripped :op-not-allowed in governor/check"))
+            (is (not (contains? (set (map :rule (:violations v))) :weapon-restraint-item-forbidden))
+                (str "op " (:op req') " tripped :weapon-restraint-item-forbidden in governor/check"))))))))

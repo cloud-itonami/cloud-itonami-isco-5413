@@ -1,0 +1,11 @@
+[{:itonami.blueprint/social-impact [:custodial-safety-integrity :due-process-integrity :facility-readiness]
+  :itonami.blueprint/domain :public-safety/facility-equipment-and-scheduling-documentation-and-logistics-coordination
+  :itonami.blueprint/required-technologies [:robotics :identity :audit-ledger]
+  :itonami.blueprint/isco-08 "5413"
+  :itonami.blueprint/name "Correctional Facility Equipment/Scheduling Documentation and Administrative-Logistics Coordination Practice"
+  :itonami.blueprint/governor :facilityops-governor
+  :itonami.blueprint/robotics true
+  :db/id -1
+  :itonami.blueprint/status :public-oss
+  :itonami.blueprint/id "cloud-itonami-isco-5413"
+  :itonami.blueprint/license "AGPL-3.0-or-later"}]

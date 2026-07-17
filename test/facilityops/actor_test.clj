@@ -1,0 +1,185 @@
+(ns facilityops.actor-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [facilityops.actor :as actor]
+            [facilityops.advisor :as advisor]
+            [facilityops.governor :as governor]
+            [facilityops.store :as store]))
+
+(defn- fresh-store []
+  (let [st (store/mem-store)]
+    (store/register-officer! st {:officer-id "O-1" :name "Officer Tanaka"
+                                 :facility-id "facility-9" :verified? true})
+    (store/register-facility! st {:facility-id "facility-9"
+                                  :max-supply-cost 500 :verified? true})
+    st))
+
+;; --- happy paths ------------------------------------------------------
+
+(deftest commits-a-well-formed-facility-log-entry
+  (let [st (fresh-store)
+        graph (actor/build-graph {:store st})
+        request {:op :log-facility-record :stake :low :officer-id "O-1" :facility-id "facility-9"
+                  :equipment-id "CAM-14" :system :perimeter-camera :condition :operational
+                  :timestamp "2026-07-14T10:00:00Z"}
+        result (actor/run-request! graph request {} "thread-1")]
+    (is (= :done (:status result)))
+    (is (some? (get-in result [:state :record])))
+    (is (= 1 (count (store/records-of st "facility-9"))))))
+
+(deftest commits-a-staff-operation-scheduling
+  (let [st (fresh-store)
+        graph (actor/build-graph {:store st})
+        request {:op :schedule-staff-operation :stake :low :officer-id "O-1" :facility-id "facility-9"
+                  :operation-type :training :proposed-time "2026-07-20T09:00:00Z" :location "training room 2"}
+        result (actor/run-request! graph request {} "thread-2")]
+    (is (= :done (:status result)))
+    (is (= 1 (count (store/records-of st "facility-9"))))))
+
+(deftest commits-an-at-or-below-threshold-supply-order
+  (let [st (fresh-store)
+        graph (actor/build-graph {:store st})
+        request {:op :coordinate-supply-order :stake :low :officer-id "O-1" :facility-id "facility-9"
+                  :item "first-aid supplies" :item-category :medical-supply :cost 40 :vendor "MedSupplyCo"}
+        result (actor/run-request! graph request {} "thread-3")]
+    (is (= :done (:status result)))
+    (is (some? (get-in result [:state :record])))))
+
+;; --- hard blocks --------------------------------------------------------
+
+(deftest holds-an-unverified-officer-proposal
+  (let [st (fresh-store)]
+    (store/register-officer! st {:officer-id "O-2" :name "Unverified"
+                                 :facility-id "facility-9" :verified? false})
+    (let [graph (actor/build-graph {:store st})
+          request {:op :log-facility-record :stake :low :officer-id "O-2" :facility-id "facility-9"
+                    :equipment-id "CAM-14" :system :perimeter-camera :condition :operational
+                    :timestamp "2026-07-14T10:00:00Z"}
+          result (actor/run-request! graph request {} "thread-4")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-9"))))))
+
+(deftest holds-an-unverified-facility-proposal
+  (let [st (fresh-store)]
+    (store/register-facility! st {:facility-id "facility-2"
+                                  :max-supply-cost 500 :verified? false})
+    (store/register-officer! st {:officer-id "O-3" :name "Officer Diallo"
+                                 :facility-id "facility-2" :verified? true})
+    (let [graph (actor/build-graph {:store st})
+          request {:op :log-facility-record :stake :low :officer-id "O-3" :facility-id "facility-2"
+                    :equipment-id "CAM-01" :system :door-lock :condition :operational
+                    :timestamp "2026-07-14T10:00:00Z"}
+          result (actor/run-request! graph request {} "thread-5")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-2"))))))
+
+(deftest holds-a-facility-mismatch-proposal
+  (let [st (fresh-store)]
+    (store/register-facility! st {:facility-id "facility-1"
+                                  :max-supply-cost 500 :verified? true})
+    (let [graph (actor/build-graph {:store st})
+          request {:op :log-facility-record :stake :low :officer-id "O-1" :facility-id "facility-1"
+                    :equipment-id "CAM-01" :system :door-lock :condition :operational
+                    :timestamp "2026-07-14T10:00:00Z"}
+          result (actor/run-request! graph request {} "thread-6")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-1"))))))
+
+(deftest holds-an-incarcerated-person-conclusion-attempt
+  (testing "log-facility-record can never identify or draw a conclusion about a specific incarcerated person,
+            even via a custom advisor"
+    (let [st (fresh-store)
+          rogue (reify advisor/Advisor
+                  (-advise [_ _store _request]
+                    {:op :log-facility-record :effect :propose :officer-id "O-1" :facility-id "facility-9"
+                     :incarcerated-person-id "IP-42" :disciplinary-conclusion :sanctioned
+                     :stake :low :confidence 0.9
+                     :rationale "documented log-facility-record for facility facility-9"}))
+          graph (actor/build-graph {:store st :advisor rogue})
+          result (actor/run-request! graph {:op :log-facility-record} {} "thread-7")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-9"))))))
+
+(deftest holds-a-staff-operation-content-attempt
+  (testing "schedule-staff-operation can never carry a use-of-force/restraint/extraction operational plan,
+            even via a custom advisor"
+    (let [st (fresh-store)
+          rogue (reify advisor/Advisor
+                  (-advise [_ _store _request]
+                    {:op :schedule-staff-operation :effect :propose :officer-id "O-1" :facility-id "facility-9"
+                     :force-plan "coordinated cell entry at 0600" :stake :low :confidence 0.9
+                     :rationale "documented schedule-staff-operation for facility facility-9"}))
+          graph (actor/build-graph {:store st :advisor rogue})
+          result (actor/run-request! graph {:op :schedule-staff-operation} {} "thread-8")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-9"))))))
+
+(deftest holds-a-weapon-restraint-supply-order-attempt-even-via-a-rogue-advisor
+  (testing "no path through this actor can procure a weapon or restraint device, regardless of cost, even via a
+            custom advisor proposing a trivially small cost to try to slip under the escalation threshold"
+    (let [st (fresh-store)
+          rogue (reify advisor/Advisor
+                  (-advise [_ _store _request]
+                    {:op :coordinate-supply-order :effect :propose :officer-id "O-1" :facility-id "facility-9"
+                     :item "restraint chair" :item-category :restraint-device :cost 1 :vendor "ShadyVendor"
+                     :stake :low :confidence 0.99
+                     :rationale "documented coordinate-supply-order for facility facility-9"}))
+          graph (actor/build-graph {:store st :advisor rogue})
+          result (actor/run-request! graph {:op :coordinate-supply-order} {} "thread-9")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-9"))))))
+
+(deftest holds-every-scope-excluded-op-attempt-even-via-a-rogue-advisor
+  (testing "no path through this actor can apply a physical restraint, use force, impose a disciplinary
+            sanction, or restrict an incarcerated person's movement/confinement conditions — proven by forcing
+            a rogue advisor to propose each named op"
+    (doseq [op governor/scope-excluded-ops]
+      (let [st (fresh-store)
+            rogue (reify advisor/Advisor
+                    (-advise [_ _store _request]
+                      {:op op :effect :propose :officer-id "O-1" :facility-id "facility-9"
+                       :stake :low :confidence 0.99
+                       :rationale (str "documented " (name op) " for facility facility-9")}))
+            graph (actor/build-graph {:store st :advisor rogue})
+            result (actor/run-request! graph {:op op} {} (str "thread-scope-" (name op)))]
+        (is (= :hold (:disposition (:state result))) (str "op " op " was not held"))
+        (is (empty? (store/records-of st "facility-9")) (str "op " op " committed a record"))))))
+
+(deftest holds-a-scope-excluded-rationale-attempt-even-via-a-rogue-advisor
+  (testing "an otherwise-allowed op whose rationale smuggles a finalization/execution action phrase is held"
+    (let [st (fresh-store)
+          rogue (reify advisor/Advisor
+                  (-advise [_ _store _request]
+                    {:op :log-facility-record :effect :propose :officer-id "O-1" :facility-id "facility-9"
+                     :equipment-id "CAM-14" :system :perimeter-camera :condition :operational
+                     :timestamp "2026-07-14T10:00:00Z"
+                     :stake :low :confidence 0.99
+                     :rationale "logged the equipment in order to apply the physical restraint"}))
+          graph (actor/build-graph {:store st :advisor rogue})
+          result (actor/run-request! graph {:op :log-facility-record} {} "thread-10")]
+      (is (= :hold (:disposition (:state result))))
+      (is (empty? (store/records-of st "facility-9"))))))
+
+;; --- escalation / human-in-the-loop --------------------------------------
+
+(deftest interrupts-then-approves-flag-facility-concern-on-human-approval
+  (let [st (fresh-store)
+        graph (actor/build-graph {:store st})
+        request {:op :flag-facility-concern :stake :low :officer-id "O-1" :facility-id nil
+                  :concern-type :staffing :note "night shift understaffed, needs supervisor review"}
+        interrupted (actor/run-request! graph request {} "thread-11")]
+    (is (= :interrupted (:status interrupted)))
+    (is (empty? (store/records-of st "facility-9")))
+    (let [resumed (actor/approve! graph "thread-11")]
+      (is (= :done (:status resumed)))
+      (is (some? (get-in resumed [:state :record]))))))
+
+(deftest interrupts-then-approves-above-threshold-supply-order-on-human-approval
+  (let [st (fresh-store)
+        graph (actor/build-graph {:store st})
+        request {:op :coordinate-supply-order :stake :low :officer-id "O-1" :facility-id "facility-9"
+                  :item "replacement generator" :item-category :maintenance-equipment :cost 5000 :vendor "FacilitySupplyCo"}
+        interrupted (actor/run-request! graph request {} "thread-12")]
+    (is (= :interrupted (:status interrupted)))
+    (let [resumed (actor/approve! graph "thread-12")]
+      (is (= :done (:status resumed)))
+      (is (some? (get-in resumed [:state :record]))))))

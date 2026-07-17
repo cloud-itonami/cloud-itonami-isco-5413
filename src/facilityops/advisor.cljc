@@ -1,0 +1,127 @@
+(ns facilityops.advisor
+  "Facility Ops Advisor — the advisor named in this repository's
+  README, proposing a facility/equipment/scheduling documentation or
+  administrative-logistics operation (log an equipment/security-system
+  readiness record, schedule a staff shift/training operation, flag a
+  facility concern for human corrections officer/supervisor review, or
+  coordinate a non-weapon facility-equipment supply order) from an
+  officer's intake queue, facility directory and supply policy.
+  Swappable mock/llm; the advisor ONLY proposes —
+  `facilityops.governor` checks officer/facility verification and
+  scope independently and always escalates facility-concern flags and
+  above-threshold supply orders. Modeled on cloud-itonami-isco-3355's
+  advisor.
+
+  This advisor NEVER proposes applying a physical restraint, using
+  force, imposing a disciplinary sanction (solitary confinement,
+  privilege revocation, etc.), or restricting an incarcerated person's
+  movement or confinement conditions — no such op exists anywhere in
+  the closed allowlist below
+  (`facilityops.governor/closed-op-allowlist`), and the rationale text
+  this advisor emits never uses a finalization/execution phrase for
+  any of those actions (`facilityops.governor/scope-excluded-terms`),
+  so the advisor's own DEFAULT proposals never self-trip the
+  governor's scope-exclusion check (see `facilityops.governor-test/
+  default-mock-advisor-proposals-never-self-trip-scope-exclusion`).
+  Any observation suggesting a facility needs human attention is
+  surfaced ONLY via `:flag-facility-concern`, which always escalates to
+  a human corrections officer/supervisor and never auto-commits — the
+  robot's role ends at \"here is the readiness/concern data\", never
+  \"here is what I recommend doing about an incarcerated person\".
+
+  A proposal:
+  {:op :log-facility-record|:schedule-staff-operation|
+       :flag-facility-concern|:coordinate-supply-order
+   :effect :propose :officer-id str :facility-id (str or nil, only nil
+   for :flag-facility-concern) :stake kw :confidence n
+   :rationale str, plus op-specific fields (:equipment-id/:system/
+   :condition/:timestamp for log-facility-record;
+   :operation-type/:proposed-time/:location for
+   schedule-staff-operation; :concern-type/:note for
+   flag-facility-concern; :item/:item-category/:cost/:vendor for
+   coordinate-supply-order)}"
+  (:require [clojure.edn :as edn]))
+
+(defprotocol Advisor
+  (-advise [advisor store request] "request -> proposal map"))
+
+(defn- rationale-for [op facility-id]
+  (str "documented " (name op)
+       (if facility-id (str " for facility " facility-id) " (no facility yet — concern intake)")))
+
+(defn- infer [_store {:keys [op stake officer-id facility-id] :as request}]
+  (let [base {:op op
+              :effect :propose
+              :officer-id officer-id
+              :facility-id facility-id
+              :stake (or stake :low)
+              :confidence (case (or stake :low) :high 0.7 :medium 0.85 :low 0.95)
+              :rationale (rationale-for op facility-id)}]
+    (merge base
+           (case op
+             :log-facility-record
+             (select-keys request [:equipment-id :system :condition :timestamp])
+             :schedule-staff-operation
+             (select-keys request [:operation-type :proposed-time :location])
+             :flag-facility-concern
+             (select-keys request [:concern-type :note])
+             :coordinate-supply-order
+             (select-keys request [:item :item-category :cost :vendor])
+             {}))))
+
+(defn mock-advisor []
+  (reify Advisor
+    (-advise [_ store request] (infer store request))))
+
+(def ^:private system-prompt
+  "You are a facility/equipment/scheduling documentation and
+   administrative-logistics coordination advisor for a correctional
+   facility. Given a request, propose an :op, the :officer-id and
+   (when relevant) :facility-id plus the op's own fields, an honest
+   :confidence and a :stake. You are a documentation and
+   logistics-coordination robot ONLY — you help log
+   equipment/security-system readiness records, schedule staff
+   shift/training operations, and coordinate non-weapon
+   facility-equipment supply orders. Never propose an op outside the
+   closed four-op allowlist (:log-facility-record,
+   :schedule-staff-operation, :flag-facility-concern,
+   :coordinate-supply-order), and NEVER propose applying a physical
+   restraint, using force, imposing a disciplinary sanction (solitary
+   confinement, privilege revocation, or any other sanction), or
+   restricting an incarcerated person's movement or confinement
+   conditions — that authority does not exist for you, under any
+   circumstance, at any confidence level. A :log-facility-record entry
+   is equipment/security-system condition metadata only, never an
+   identification of or conclusion about a specific incarcerated
+   person. A :schedule-staff-operation proposal is shift/training
+   scheduling logistics only — never a use-of-force, restraint or
+   cell-extraction operational plan. A :coordinate-supply-order must
+   never name a weapon or physical-restraint device (firearm, taser,
+   baton, handcuffs, restraint chair, chemical agent, etc.) — such an
+   item is refused regardless of cost. Any indication that a facility
+   needs human corrections officer/supervisor attention must be
+   surfaced only via :flag-facility-concern, which always requires
+   human review regardless of confidence. The governor independently
+   verifies officer/facility registration and always escalates
+   facility-concern flags and above-threshold non-weapon supply orders
+   to a human.")
+
+(defn- parse-proposal [content]
+  (try
+    (let [p (edn/read-string content)]
+      (if (map? p)
+        (assoc p :effect :propose)
+        {:op :unknown :effect :propose :confidence 0.0 :stake :high
+         :rationale "unparseable LLM response"}))
+    (catch #?(:clj Exception :cljs js/Error) _
+      {:op :unknown :effect :propose :confidence 0.0 :stake :high
+       :rationale "LLM response parse failure"})))
+
+(defn llm-advisor
+  [chat-model model-generate-fn gen-opts]
+  (reify Advisor
+    (-advise [_ _store request]
+      (let [msgs [{:role :system :content system-prompt}
+                  {:role :user :content (str "operation request: " (pr-str request))}]
+            resp (model-generate-fn chat-model msgs gen-opts)]
+        (parse-proposal (:content resp))))))
