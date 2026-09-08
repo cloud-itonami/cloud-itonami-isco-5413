@@ -140,7 +140,7 @@
                                 item is instead HARD-blocked per #7
                                 regardless of cost).
     11. low confidence (< `confidence-floor`)."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [facilityops.store :as store]))
 
 (def confidence-floor 0.6)
@@ -270,7 +270,7 @@
   `weapon-restraint-item-terms` phrase as free-text prose (\"restraint
   device\")."
   [s]
-  (-> (str s) str/lower-case (str/replace #"[-_]+" " ")))
+  (-> (str s) str/lower (str/replace #"[-_]+" " ")))
 
 (defn weapon-restraint-item?
   "True if `proposal`'s :item or :item-category names a weapon or
