@@ -47,7 +47,7 @@ doing about an incarcerated person."
 (`facilityops.governor`), following the itonami actor pattern
 (ADR-2607121000): `:intake -> :advise -> :govern -> :decide -+-> :commit
 (:ok?) +-> :request-approval (:escalate?, human-in-the-loop interrupt)
-+-> :hold (:hard?)`. 51 tests / 172 assertions green (`clojure -M:test`).
++-> :hold (:hard?)`. 51 tests / 172 assertions green (`kbb -M:test`).
 
 HARD invariants (always hold, never overridable): officer provenance
 (a proposal must resolve to an independently registered AND verified
