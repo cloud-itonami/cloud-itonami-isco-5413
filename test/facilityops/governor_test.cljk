@@ -1,5 +1,5 @@
 (ns facilityops.governor-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [kotoba.test :refer [deftest is testing]]
             [facilityops.store :as store]
             [facilityops.advisor :as advisor]
             [facilityops.governor :as governor]))
