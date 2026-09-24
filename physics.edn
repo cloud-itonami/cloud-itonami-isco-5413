@@ -1,0 +1,35 @@
+;; What this vertical's robot physically does, declared for
+;; kotoba.robotics.process (kotoba-lang/robotics). `kbb -M:physics` runs it.
+;;
+;; README "Robotics premise": a facility documentation and logistics robot
+;; handles equipment/security-system readiness data entry, staff scheduling
+;; and non-weapon facility-equipment procurement for prison guards (ISCO 5413).
+;; Its physical work is facility logistics: pushing a supply cart (linen,
+;; forms, maintenance spares) along staff corridors between the stores and a
+;; wing office, and shelving delivered cartons in the storeroom. It never
+;; restrains, confines or moves an incarcerated person.
+;;
+;; Every number without a cited source is marked `estimate` in its :basis.
+;; Replacing an estimate with a sourced value is this bot's growth work.
+{:physics/schema "itonami.physical-ai.spec.v1"
+ :repo "cloud-itonami/cloud-itonami-isco-5413"
+ :cases
+ [{:id :supply-cart-to-wing-office
+   :kind :transport
+   :procedure "logistics robot carries a cart of non-weapon facility supplies from central stores to a wing office through staff corridors"
+   :params {:mass-kg 70.0 :payload-kg 40.0 :v-max-mps 0.8 :a-max-mps2 0.4
+            :brake-decel-mps2 0.8 :drive-force-n 120.0 :crr 0.02
+            :cog-height-m 0.60 :support-half-length-m 0.30}
+   :sweep {:param :distance-m :values [20.0 50.0 100.0 150.0 200.0]}
+   :quantity :cycle-time-s
+   :limit {:max 180.0 :basis "estimate: one stores-to-wing leg must fit inside the 3-minute corridor-clear window between scheduled movements"}
+   :boundary {:lo 10.0 :hi 400.0}}
+  {:id :carton-to-storeroom-shelf
+   :kind :manipulator
+   :procedure "arm lifts a delivered carton of facility supplies from the cart deck onto a storeroom shelf"
+   :params {:l1-m 0.50 :l2-m 0.45 :m1-kg 5.0 :m2-kg 3.5
+            :from [0.60 0.05] :to [0.25 0.80] :duration-s 2.5 :steps 500}
+   :sweep {:param :payload-kg :values [1.0 3.0 5.0 8.0 12.0]}
+   :quantity :peak-tau1-nm
+   :limit {:max 90.0 :basis "estimate: continuous shoulder torque of a ~10 kg payload class collaborative arm"}
+   :boundary {:lo 0.1 :hi 30.0}}]}
