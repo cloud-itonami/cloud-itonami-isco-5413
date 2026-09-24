@@ -40,7 +40,7 @@
    schedule-staff-operation; :concern-type/:note for
    flag-facility-concern; :item/:item-category/:cost/:vendor for
    coordinate-supply-order)}"
-  (:require [clojure.edn :as edn]))
+  (:require [kotoba.lang.edn :as edn]))
 
 (defprotocol Advisor
   (-advise [advisor store request] "request -> proposal map"))
